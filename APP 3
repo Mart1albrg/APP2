@@ -1,0 +1,389 @@
+"""
+APP3
+"""
+
+import json
+import heapq
+from collections import deque
+import os
+
+
+
+# 1. CHARGEMENT ET CONSTRUCTION DU GRAPHE
+
+
+def charger_reseau(fichier_json):
+    """Charge un fichier JSON et retourne les données du réseau."""
+    with open(fichier_json, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def construire_graphe(reseau):
+    """
+    Construit une liste d'adjacence.
+
+
+    Pour les réseaux sans connexions explicites, elles sont générées
+    automatiquement à partir de la liste ordonnée des stations de chaque ligne.
+    Les correspondances ajoutent des arcs de transfert entre lignes.
+    """
+    graphe = {}
+    temps_moyen = reseau.get("temps_moyen", 120)
+
+    # Initialise tous les sommets
+    for ligne_id, ligne in reseau["lignes"].items():
+        for station in ligne["stations"]:
+            if station not in graphe:
+                graphe[station] = []
+
+    # Connexions explicites
+    if reseau.get("connexions"):
+        for c in reseau["connexions"]:
+            graphe.setdefault(c["de"], []).append((c["vers"], c["temps"], c["ligne"]))
+    else:
+        # Génèration des connexions entre stations consécutives de chaque ligne
+        for ligne_id, ligne in reseau["lignes"].items():
+            stations = ligne["stations"]
+            for i in range(len(stations) - 1):
+                a, b = stations[i], stations[i + 1]
+                graphe[a].append((b, temps_moyen, ligne_id))
+                graphe[b].append((a, temps_moyen, ligne_id))
+
+    # Correspondances : arc de transfert entre deux lignes à la même station
+    for corresp in reseau.get("correspondances", []):
+        station = corresp["station"]
+        t = corresp["temps"]
+        if station not in graphe:
+            graphe[station] = []
+        # Nœud en mode fantôme pour modéliser le changement de ligne
+        fantome = station + "__corresp"
+        graphe[station].append((fantome, t, None))
+        if fantome not in graphe:
+            graphe[fantome] = []
+        graphe[fantome].append((station, 0, None))
+
+    return graphe
+
+
+
+# 2. BFS — chemin avec le moins d'arrêts
+
+
+def bfs(graphe, depart):
+    """Parcours en largeur. Retourne l'ordre de visite des sommets."""
+    couleur = {s: "blanc" for s in graphe}
+    couleur[depart] = "gris"
+    file = deque([depart])
+    chemin = []
+
+    while file:
+        sommet = file.popleft()
+        chemin.append(sommet)
+        for (voisin, _, _) in graphe.get(sommet, []):
+            if couleur.get(voisin, "blanc") == "blanc":
+                couleur[voisin] = "gris"
+                file.append(voisin)
+        couleur[sommet] = "noir"
+
+    return chemin
+
+
+def bfs_chemin(graphe, depart, arrivee):
+    """BFS : retourne le chemin avec le moins d'arrêts (sans compter les nœuds fantômes)."""
+    parents = {depart: None}
+    file = deque([depart])
+
+    while file:
+        sommet = file.popleft()
+        if sommet == arrivee:
+            break
+        for (voisin, _, _) in graphe.get(sommet, []):
+            if voisin not in parents:
+                parents[voisin] = sommet
+                file.append(voisin)
+
+    if arrivee not in parents:
+        return None
+
+    chemin = []
+    s = arrivee
+    while s is not None:
+        chemin.append(s)
+        s = parents[s]
+    # Filtre les nœuds fantômes de correspondance
+    return [s for s in reversed(chemin) if "__corresp" not in s]
+
+
+
+# 3. DFS — parcours en profondeur
+
+
+def dfs(graphe, depart):
+    """Parcours en profondeur. Retourne l'ordre de visite des sommets."""
+    couleur = {s: "blanc" for s in graphe}
+    couleur[depart] = "gris"
+    pile = [depart]
+    chemin = [depart]
+
+    while pile:
+        sommet = pile[-1]
+        voisins_blancs = [v for (v, _, _) in graphe.get(sommet, [])
+                          if couleur.get(v, "blanc") == "blanc"]
+        if voisins_blancs:
+            v = voisins_blancs[0]
+            couleur[v] = "gris"
+            chemin.append(v)
+            pile.append(v)
+        else:
+            pile.pop()
+            couleur[sommet] = "noir"
+
+    return chemin
+
+
+
+# 4. DIJKSTRA — chemin le plus rapide
+
+
+def dijkstra(graphe, depart, arrivee):
+    """
+    Dijkstra sur graphe pondéré.
+    Retourne (distances, parents) depuis 'depart'.
+    """
+    distances = {s: float("inf") for s in graphe}
+    distances[depart] = 0
+    parents = {depart: None}
+    tas = [(0, depart)]
+
+    while tas:
+        dist_u, u = heapq.heappop(tas)
+        if dist_u > distances[u]:
+            continue
+        if u == arrivee:
+            break
+        for (voisin, poids, ligne) in graphe.get(u, []):
+            nouvelle_dist = distances[u] + poids
+            if nouvelle_dist < distances.get(voisin, float("inf")):
+                distances[voisin] = nouvelle_dist
+                parents[voisin] = (u, ligne)
+                heapq.heappush(tas, (nouvelle_dist, voisin))
+
+    return distances, parents
+
+
+def reconstruire_chemin(parents, depart, arrivee):
+    """Reconstruit la liste [(station, ligne)] depuis le dictionnaire parents."""
+    chemin = []
+    s = arrivee
+    while s != depart:
+        if s not in parents or parents[s] is None:
+            return None
+        precedent, ligne = parents[s]
+        chemin.append((s, ligne))
+        s = precedent
+    chemin.append((depart, None))
+    return list(reversed(chemin))
+
+
+
+# 5. AFFICHAGE DE L'ITINÉRAIRE
+
+def afficher_itineraire(chemin, reseau, temps_total):
+    """
+    Affiche l'itinéraire de façon lisible :
+    Monter / Continuer / Correspondance / Descendre
+    """
+    if not chemin or len(chemin) < 2:
+        print("  Vous êtes déjà à destination !")
+        return
+
+    noms_lignes = {lid: l["nom"] for lid, l in reseau["lignes"].items()}
+
+    # Filtre les nœuds fantômes et détermine la ligne pour chaque étape réelle
+    # On propage la dernière ligne connue sur les arcs de correspondance
+    etapes = []
+    ligne_courante = None
+    for (station, ligne) in chemin:
+        if "__corresp" in station:
+            continue
+        if ligne is not None:
+            ligne_courante = ligne
+        etapes.append((station, ligne_courante))
+
+    print()
+    # Trouve la première ligne réelle (non None) pour l'affichage de la montée
+    premiere_ligne = next((lg for (_, lg) in etapes if lg), None)
+    ligne_affichee = None
+    for i, (station, ligne) in enumerate(etapes):
+        nom_ligne = noms_lignes.get(ligne, ligne) if ligne else "?"
+        if i == 0:
+            ligne_affichee = premiere_ligne
+            nom_dep = noms_lignes.get(premiere_ligne, premiere_ligne) if premiere_ligne else "?"
+            print(f"  Monter station {station}, {nom_dep}")
+        elif i == len(etapes) - 1:
+            print(f"  Descendre station {station}, {noms_lignes.get(ligne_affichee, ligne_affichee)}")
+        elif ligne != ligne_affichee and ligne is not None:
+            print(f"  Correspondance station {station}, prendre la {nom_ligne}")
+            ligne_affichee = ligne
+        else:
+            print(f"  Continuer station {station}")
+
+    minutes = temps_total // 60
+    secondes = temps_total % 60
+    print(f"\n  Temps total estimé : {minutes} minutes {secondes} secondes\n")
+
+
+
+# 6. UTILITAIRES
+
+def est_connexe(graphe):
+    """Vérifie si le graphe est connexe (BFS depuis un sommet quelconque)."""
+    if not graphe:
+        return True
+    depart = next(iter(graphe))
+    visites = set(bfs(graphe, depart))
+    return len(visites) == len(graphe)
+
+
+def stations_correspondance(reseau):
+    """Retourne la liste des stations de correspondance avec leurs lignes."""
+    return [(c["station"], c["lignes"]) for c in reseau.get("correspondances", [])]
+
+
+
+# 7. INTERFACE CONSOLE
+
+
+VILLES = {
+    "1": ("Paris",              "paris.json"),
+    "2": ("Lyon",               "lyon.json"),
+    "3": ("Lille",              "lille.json"),
+    "4": ("Bordeaux",           "bordeaux.json"),
+    "5": ("Mini-réseau fictif", "mini_reseau.json"),
+}
+
+DOSSIERS = [
+    os.path.dirname(os.path.abspath(__file__)),
+    "/mnt/user-data/uploads",
+    ".",
+]
+
+
+def trouver_fichier(nom_fichier):
+    for dossier in DOSSIERS:
+        chemin = os.path.join(dossier, nom_fichier)
+        if os.path.exists(chemin):
+            return chemin
+    return None
+
+
+def choisir_ville():
+    print("\n" + "=" * 52)
+    print("   🚇  CALCULATEUR D'ITINÉRAIRES  🚇")
+    print("=" * 52)
+    print("\n  Villes disponibles :")
+    for k, (nom, _) in VILLES.items():
+        print(f"    {k}. {nom}")
+    print()
+    while True:
+        choix = input("  Choisissez une ville (numéro) : ").strip()
+        if choix in VILLES:
+            return VILLES[choix]
+        print("  ❌ Choix invalide, réessayez.")
+
+
+def saisir_station(graphe, invite):
+    """Demande une station avec recherche approximative."""
+    stations_reelles = sorted(s for s in graphe if "__corresp" not in s)
+    while True:
+        saisie = input(f"  {invite} : ").strip()
+        if saisie in stations_reelles:
+            return saisie
+        # Recherche insensible à la casse
+        candidats = [s for s in stations_reelles if saisie.lower() in s.lower()]
+        if len(candidats) == 1:
+            print(f"  → Station trouvée : {candidats[0]}")
+            return candidats[0]
+        elif len(candidats) > 1:
+            print("  Stations correspondantes :")
+            for c in candidats[:10]:
+                print(f"    - {c}")
+        else:
+            print("  ❌ Station introuvable. Vérifiez l'orthographe.")
+
+
+def menu_principal():
+    nom_ville, fichier = choisir_ville()
+
+    chemin_fichier = trouver_fichier(fichier)
+    if not chemin_fichier:
+        print(f"  ❌ Fichier '{fichier}' introuvable.")
+        return
+
+    reseau = charger_reseau(chemin_fichier)
+    graphe = construire_graphe(reseau)
+
+    nb_stations = sum(1 for s in graphe if "__corresp" not in s)
+    print(f"\n  ✅ Réseau {nom_ville} chargé : {nb_stations} stations")
+    if est_connexe(graphe):
+        print("  ✅ Le réseau est connexe")
+    else:
+        print("  ⚠️  Réseau non entièrement connexe")
+
+    while True:
+        print("\n" + "-" * 52)
+        print("  1. Calculer un itinéraire (Dijkstra — plus rapide)")
+        print("  2. Chemin avec le moins d'arrêts (BFS)")
+        print("  3. Stations de correspondance")
+        print("  4. Changer de ville")
+        print("  5. Quitter")
+        print()
+        action = input("  Votre choix : ").strip()
+
+        if action == "1":
+            depart  = saisir_station(graphe, "Station de départ")
+            arrivee = saisir_station(graphe, "Station d'arrivée")
+            distances, parents = dijkstra(graphe, depart, arrivee)
+            if distances.get(arrivee, float("inf")) == float("inf"):
+                print("  ❌ Aucun itinéraire trouvé.")
+            else:
+                chemin = reconstruire_chemin(parents, depart, arrivee)
+                afficher_itineraire(chemin, reseau, int(distances[arrivee]))
+
+        elif action == "2":
+            depart  = saisir_station(graphe, "Station de départ")
+            arrivee = saisir_station(graphe, "Station d'arrivée")
+            chemin_bfs = bfs_chemin(graphe, depart, arrivee)
+            if not chemin_bfs:
+                print("  ❌ Aucun itinéraire trouvé.")
+            else:
+                print(f"\n  Chemin BFS ({len(chemin_bfs)-1} arrêts) :")
+                for s in chemin_bfs:
+                    print(f"    → {s}")
+
+        elif action == "3":
+            corresp = stations_correspondance(reseau)
+            print(f"\n  Stations de correspondance ({len(corresp)}) :")
+            for station, lignes in corresp:
+                print(f"    • {station} — lignes : {', '.join(lignes)}")
+
+        elif action == "4":
+            nom_ville, fichier = choisir_ville()
+            chemin_fichier = trouver_fichier(fichier)
+            if not chemin_fichier:
+                print(f"  ❌ Fichier '{fichier}' introuvable.")
+                continue
+            reseau = charger_reseau(chemin_fichier)
+            graphe = construire_graphe(reseau)
+            nb_stations = sum(1 for s in graphe if "__corresp" not in s)
+            print(f"\n  ✅ Réseau {nom_ville} chargé : {nb_stations} stations")
+
+        elif action == "5":
+            print("\n  À bientôt ! 👋\n")
+            break
+        else:
+            print("  ❌ Choix invalide.")
+
+
+if __name__ == "__main__":
+    menu_principal()
